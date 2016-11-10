@@ -115,51 +115,52 @@ type KvEntry = Entry KvCmd
 
 data PersistentState cmd
   = PersistentState
-    { ps_currentTerm :: Term
-    , ps_votedFor :: ServerId
-    , ps_log :: [Entry cmd]
+    { ps_currentTerm :: !Term
+    , ps_votedFor :: !ServerId
+      -- Use something more efficient later.
+    , ps_log :: ![Entry cmd]
     }
   deriving ( Show )
 
 data VolatileState
   = VolatileState
-    { vs_commitIndex :: Index
-    , vs_lastApplied :: Index
+    { vs_commitIndex :: !Index
+    , vs_lastApplied :: !Index
     }
   deriving ( Show )
 
 data VolatileLeaderState
   = VolatileLeaderState
-    { vls_nextIndex :: Map ServerId Index
-    , vls_matchIndex :: Map ServerId Index
+    { vls_nextIndex :: !(Map ServerId Index)
+    , vls_matchIndex :: !(Map ServerId Index)
     }
   deriving ( Show )
 
 data Rpc cmd
   = AppendEntries
-    { r_term :: Term
-    , r_leaderId :: ServerId
-    , r_prevLogIndex :: Index
-    , r_prevLogTerm :: Term
-    , r_entries :: [Entry cmd]
-    , r_leaderCommit :: Index
+    { r_term :: !Term
+    , r_leaderId :: !ServerId
+    , r_prevLogIndex :: !Index
+    , r_prevLogTerm :: !Term
+    , r_entries :: ![Entry cmd]
+    , r_leaderCommit :: !Index
     }
   | RequestVote
-    { r_term :: Term
-    , r_candidateId :: ServerId
-    , r_lastLogIndex :: Index
-    , r_lastLogTerm :: Term
+    { r_term :: !Term
+    , r_candidateId :: !ServerId
+    , r_lastLogIndex :: !Index
+    , r_lastLogTerm :: !Term
     }
   deriving ( Show )
 
 data RpcResponse
   = AppendEntriesResponse
-    { rr_term :: Term
-    , rr_success :: Bool
+    { rr_term :: !Term
+    , rr_success :: !Bool
     }
   | RequestVoteResponse
-    { rr_term :: Term
-    , rr_voteGranted :: Bool
+    { rr_term :: !Term
+    , rr_voteGranted :: !Bool
     }
   deriving ( Show )
 
