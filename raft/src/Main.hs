@@ -1,7 +1,12 @@
 module Main where
 
-import Data.Map ( Map )
-import qualified Data.Map as Map
+import qualified Control.Concurrent as CC
+import           Control.Concurrent.Async ( Async )
+import qualified Control.Concurrent.Async as CCA
+import           Control.Concurrent.MVar ( MVar )
+import qualified Control.Concurrent.MVar as CCM
+import           Data.Map.Strict ( Map )
+import qualified Data.Map.Strict as Map
 
 main :: IO ()
 main = do
@@ -85,6 +90,101 @@ main = do
 --
 --   - timer can be canceled / reset without firing its event.
 
+-- | Run a delayed action, returning a handle that can be used to
+-- cancel the delayed action -- using 'CCA.cancel' -- if it has not
+-- run yet.
+--
+-- - delay: time to delay in milliseconds.
+-- - action: the action to run after the delay.
+delayedAction :: Int -> IO () -> IO (Async ())
+delayedAction delay action = do
+  CCA.async $ CC.threadDelay delay >> action
+
+-- | The election timeout is randomly chosen between 'electionTimeout'
+-- and @2 * electionTimeout@, on each iteration of the election loop.
+electionTimeout :: Int
+electionTimeout = 150 -- Paper suggestion.
+
+-- | All of the server state.
+--
+-- Need to add the volatile and persistent state here, the special
+-- leader state, etc.
+--
+-- I'm threading the state manually below ...
+data ServerState cmd
+  = ServerState
+      -- Expect contention on the timer.
+    { ss_timer :: !(MVar (Async ()))
+      -- Not sure about contention on the role yet.
+    , ss_role :: !(MVar ServerRole)
+    , ss_persistentState :: !(MVar (PersistentState cmd))
+    }
+
+startElectionTimer :: ServerState cmd -> IO ()
+startElectionTimer ss = do
+  delay <- error "TODO: choose a random election timeout between T and 2*T!"
+  timer <- delayedAction delay $ handleElectionTimeout ss
+  CCM.putMVar (ss_timer ss) timer
+
+restartElectionTimer :: ServerState cmd -> IO ()
+restartElectionTimer ss = do
+  CCA.cancel =<< CCM.takeMVar (ss_timer ss)
+  startElectionTimer ss
+
+handleElectionTimeout :: ServerState cmd -> IO ()
+handleElectionTimeout ss = do
+  role <- CCM.takeMVar $ ss_role ss
+  case role of
+    Leader -> error "The leader should not be running an election timer!"
+    Follower -> startElection ss
+    Candidate -> startElection ss
+
+-- | Start an election with our self as candidate.
+--
+-- Things are getting a little tricky here: I'm assuming that the role
+-- mvar was consumed and is now empty; this function will fill it
+-- again.
+--
+-- Election process (Figure 2):
+--
+-- - increment current term
+-- - vote for self
+-- - reset election timer
+-- - send request vote rpc to other servers
+--
+-- The main loop (elsewhere) then waits for three possible outcomes,
+-- which are handled separately:
+--
+-- 1. If we get majority of votes, convert to leader.
+--
+-- 2. If we receive append entries rpc from new leader, become
+--    follower.
+--
+-- 3. If election timeout, try again.
+startElection :: ServerState cmd -> IO ()
+startElection ss = do
+  CCM.putMVar (ss_role ss) Candidate
+  incrementTerm
+  voteForSelf
+  restartElectionTimer ss
+  requestVotes
+  where
+    incrementTerm =
+      modifyPersistentState ss
+        -- TODO: try simplifying with lenses?
+        (\ps -> ps { ps_currentTerm = 1 + ps_currentTerm ps })
+    voteForSelf = undefined -- HERE
+    requestVotes = undefined
+
+modifyPersistentState :: ServerState cmd -> (PersistentState cmd -> PersistentState cmd) -> IO ()
+modifyPersistentState ss f = do
+  CCM.modifyMVar_ (ss_persistentState ss) (return . f)
+  persist ss
+  where
+    -- Not actually persisting anything right now. For testing, I'm
+    -- just going to pause server threads, not actually kill them, so
+    -- I don't really need persistent storage here.
+    persist _ss = return ()
 
 ----------------------------------------------------------------
 -- * Types
