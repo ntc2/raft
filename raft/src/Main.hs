@@ -172,7 +172,7 @@ startElection ss = do
       let Entry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
       let sids = c_serverIds . ps_config $ ps
       CM.forM_ sids $ \sid ->
-        sendRpc sid $ RequestVote
+        sendRpc ss sid $ RequestVote
           { r_term = ps_currentTerm ps
           , r_candidateId = ps_myServerId ps
           , r_lastLogIndex = lastLogIndex
@@ -197,9 +197,16 @@ modifyPersistentState ss f = do
 ----------------------------------------------------------------
 
 -- | Send an RPC to another server.
-sendRpc :: ServerId -> Rpc cmd -> IO ()
-sendRpc sid rpc = do
-  undefined sid rpc
+sendRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
+sendRpc ss sid rpc = do
+  undefined ss sid rpc
+
+-- | Receive an RPC from another server.
+--
+-- This is the main the loop, in the form of an event handler.
+receiveRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
+receiveRpc ss sid rpc = do
+  undefined ss sid rpc
 
 ----------------------------------------------------------------
 -- * Types
@@ -271,22 +278,19 @@ data Rpc cmd
     , r_entries :: ![Entry cmd]
     , r_leaderCommit :: !Index
     }
+  | AppendEntriesResponse
+    { r_term :: !Term
+    , r_success :: !Bool
+    }
   | RequestVote
     { r_term :: !Term
     , r_candidateId :: !ServerId
     , r_lastLogIndex :: !Index
     , r_lastLogTerm :: !Term
     }
-  deriving ( Show )
-
-data RpcResponse
-  = AppendEntriesResponse
-    { rr_term :: !Term
-    , rr_success :: !Bool
-    }
   | RequestVoteResponse
-    { rr_term :: !Term
-    , rr_voteGranted :: !Bool
+    { r_term :: !Term
+    , r_voteGranted :: !Bool
     }
   deriving ( Show )
 
