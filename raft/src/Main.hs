@@ -5,6 +5,7 @@ import           Control.Concurrent.Async ( Async )
 import qualified Control.Concurrent.Async as CCA
 import           Control.Concurrent.MVar ( MVar )
 import qualified Control.Concurrent.MVar as CCM
+import qualified Control.Monad as CM
 import           Data.Map.Strict ( Map )
 import qualified Data.Map.Strict as Map
 
@@ -44,7 +45,7 @@ main = do
 --     - Becomes candidate if heartbeat is not received during timeout.
 --
 --       - [ ] How is the heartbeat timeout determined? Iirc it's
---         randomly chosen, but I don't remember if that's everytime,
+--         randomly chosen, but I don't remember if that's every time,
 --         or once per server (presumably every time ...).
 --
 --   - Candidate:
@@ -76,11 +77,11 @@ main = do
 -- Tasks
 --
 -- - [ ] Implement resetable timer loop. E.g., for the leader, want a
---   loop that determines when to send heartbeats, that is reset on
---   for any other communication with corresponding follower. But to
+--   loop that determines when to send heartbeats, that is reset for
+--   any other communication with corresponding follower. But to
 --   start, can just send heartbeats regardless of whether they are
 --   necessary and save the resets for later optimization. But for
---   followers and candidates we really do need an interuptable
+--   followers and candidates we really do need an interruptible
 --   election timer.
 --
 --   Properties:
@@ -100,25 +101,10 @@ delayedAction :: Int -> IO () -> IO (Async ())
 delayedAction delay action = do
   CCA.async $ CC.threadDelay delay >> action
 
--- | The election timeout is randomly chosen between 'electionTimeout'
--- and @2 * electionTimeout@, on each iteration of the election loop.
-electionTimeout :: Int
-electionTimeout = 150 -- Paper suggestion.
-
--- | All of the server state.
---
--- Need to add the volatile and persistent state here, the special
--- leader state, etc.
---
--- I'm threading the state manually below ...
-data ServerState cmd
-  = ServerState
-      -- Expect contention on the timer.
-    { ss_timer :: !(MVar (Async ()))
-      -- Not sure about contention on the role yet.
-    , ss_role :: !(MVar ServerRole)
-    , ss_persistentState :: !(MVar (PersistentState cmd))
-    }
+-- | The election timeout is randomly chosen between 'minElectionTimeout'
+-- and @2 * minElectionTimeout@, on each iteration of the election loop.
+minElectionTimeout :: Int
+minElectionTimeout = 150 -- Paper suggestion.
 
 startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
@@ -173,9 +159,19 @@ startElection ss = do
       modifyPersistentState ss
         -- TODO: try simplifying with lenses?
         (\ps -> ps { ps_currentTerm = 1 + ps_currentTerm ps })
-    voteForSelf = undefined -- HERE
+    voteForSelf = do
+      modifyPersistentState ss $ \ps ->
+        ps { ps_votedFor = ps_myServerId ps }
+      -- Initialize the volatile candidate state and count our self
+      -- vote. If we add more fields to the volatile candidate state,
+      -- then create a separate initialization function.
+      CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
+        (Just $ VolatileCandidateState { vcs_numVotesReceived = 1 })
     requestVotes = undefined
 
+-- | The persistent state is modified through this function, not
+-- directly by callers of this function, so that we can handle
+-- persistence in this one place.
 modifyPersistentState :: ServerState cmd -> (PersistentState cmd -> PersistentState cmd) -> IO ()
 modifyPersistentState ss f = do
   CCM.modifyMVar_ (ss_persistentState ss) (return . f)
@@ -219,6 +215,11 @@ data PersistentState cmd
     , ps_votedFor :: !ServerId
       -- Use something more efficient later.
     , ps_log :: ![Entry cmd]
+      -- Id of this server.
+    , ps_myServerId :: !ServerId
+      -- Persistent in case we implement live configuration changes
+      -- later.
+    , ps_config :: !Config
     }
   deriving ( Show )
 
@@ -233,6 +234,12 @@ data VolatileLeaderState
   = VolatileLeaderState
     { vls_nextIndex :: !(Map ServerId Index)
     , vls_matchIndex :: !(Map ServerId Index)
+    }
+  deriving ( Show )
+
+data VolatileCandidateState
+  = VolatileCandidateState
+    { vcs_numVotesReceived :: !Integer
     }
   deriving ( Show )
 
@@ -268,4 +275,33 @@ data ServerRole
   = Candidate
   | Follower
   | Leader
-    deriving ( Show )
+  deriving ( Show )
+
+-- | The configuration of the collection of servers.
+--
+-- The Raft paper describes a protocol for updating the
+-- configuration. For now we're going to assume it's constant for the
+-- life of the servers.
+data Config
+  = Config
+    { sc_serverIds :: ![ServerId] -- ^ The set of all server ids.
+    }
+  deriving ( Show )
+
+-- | All of the server state.
+--
+-- Need to add the volatile and persistent state here, the special
+-- leader state, etc.
+--
+-- I'm threading the state manually below ...
+data ServerState cmd
+  = ServerState
+      -- Expect contention on the timer.
+    { ss_timer :: !(MVar (Async ()))
+      -- Not sure about contention on the role yet.
+    , ss_role :: !(MVar ServerRole)
+    , ss_persistentState :: !(MVar (PersistentState cmd))
+    , ss_volatileState :: !(MVar VolatileState)
+    , ss_volatileLeaderState :: !(MVar (Maybe VolatileLeaderState))
+    , ss_volatileCandidateState :: !(MVar (Maybe VolatileCandidateState))
+    }
