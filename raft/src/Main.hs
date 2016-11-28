@@ -167,7 +167,17 @@ startElection ss = do
       -- then create a separate initialization function.
       CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
         (Just $ VolatileCandidateState { vcs_numVotesReceived = 1 })
-    requestVotes = undefined
+    requestVotes = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      let Entry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
+      let sids = c_serverIds . ps_config $ ps
+      CM.forM_ sids $ \sid ->
+        sendRpc sid $ RequestVote
+          { r_term = ps_currentTerm ps
+          , r_candidateId = ps_myServerId ps
+          , r_lastLogIndex = lastLogIndex
+          , r_lastLogTerm = lastLogTerm
+          }
 
 -- | The persistent state is modified through this function, not
 -- directly by callers of this function, so that we can handle
@@ -181,6 +191,15 @@ modifyPersistentState ss f = do
     -- just going to pause server threads, not actually kill them, so
     -- I don't really need persistent storage here.
     persist _ss = return ()
+
+----------------------------------------------------------------
+-- * RPCs
+----------------------------------------------------------------
+
+-- | Send an RPC to another server.
+sendRpc :: ServerId -> Rpc cmd -> IO ()
+sendRpc sid rpc = do
+  undefined sid rpc
 
 ----------------------------------------------------------------
 -- * Types
@@ -284,7 +303,7 @@ data ServerRole
 -- life of the servers.
 data Config
   = Config
-    { sc_serverIds :: ![ServerId] -- ^ The set of all server ids.
+    { c_serverIds :: ![ServerId] -- ^ The set of all server ids.
     }
   deriving ( Show )
 
