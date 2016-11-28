@@ -8,6 +8,8 @@ import qualified Control.Concurrent.MVar as CCM
 import qualified Control.Monad as CM
 import           Data.Map.Strict ( Map )
 import qualified Data.Map.Strict as Map
+import           Data.Set ( Set )
+import qualified Data.Set as Set
 
 main :: IO ()
 main = do
@@ -162,11 +164,13 @@ startElection ss = do
     voteForSelf = do
       modifyPersistentState ss $ \ps ->
         ps { ps_votedFor = ps_myServerId ps }
+      ps <- CCM.readMVar (ss_persistentState ss)
       -- Initialize the volatile candidate state and count our self
       -- vote. If we add more fields to the volatile candidate state,
       -- then create a separate initialization function.
       CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
-        (Just $ VolatileCandidateState { vcs_numVotesReceived = 1 })
+        (Just $ VolatileCandidateState
+          { vcs_votesReceived = Set.singleton $ ps_myServerId ps })
     requestVotes = do
       ps <- CCM.readMVar (ss_persistentState ss)
       let Entry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
@@ -206,7 +210,47 @@ sendRpc ss sid rpc = do
 -- This is the main the loop, in the form of an event handler.
 receiveRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
 receiveRpc ss sid rpc = do
-  undefined ss sid rpc
+  case rpc of
+    AppendEntries {} -> undefined
+    AppendEntriesResponse {} -> undefined
+    RequestVote {} -> undefined
+    RequestVoteResponse {} -> handleRequestVoteResponse
+  where
+    -- Cases to consider:
+    --
+    -- - vote was granted and vote term is equal to our term: count
+    --   vote and convert to leader if we have a majority.
+    --
+    -- - vote was granted and vote term is not equal to our term:
+    --   ignore stale vote.
+    --
+    -- - vote was not granted: check the vote term. If it's greater
+    --   than our term, update our term and stop being a candidate? Or
+    --   just ignore the vote: we should receive a request vote or
+    --   append entries rpc soon enough ...
+    --
+    -- If we're not a candidate, then we ignore the vote.
+    handleRequestVoteResponse = do
+      role <- CCM.readMVar (ss_role ss)
+      ps <- CCM.readMVar (ss_persistentState ss)
+      CM.when (role == Candidate &&
+            r_voteGranted rpc &&
+            r_term rpc == ps_currentTerm ps) $ do
+        Just vcs <- CCM.takeMVar (ss_volatileCandidateState ss)
+        let votes = Set.insert sid (vcs_votesReceived vcs)
+        CCM.putMVar (ss_volatileCandidateState ss)
+          (Just $ vcs { vcs_votesReceived = votes })
+        let numServers = length . c_serverIds . ps_config $ ps
+        let numVotes = Set.size votes
+        CM.when (2 * numVotes > numServers) $
+          becomeLeader ss
+
+-- | Become a leader.
+--
+-- See page 4 ...
+becomeLeader :: ServerState cmd -> IO ()
+becomeLeader ss = do
+  undefined
 
 ----------------------------------------------------------------
 -- * Types
@@ -265,7 +309,7 @@ data VolatileLeaderState
 
 data VolatileCandidateState
   = VolatileCandidateState
-    { vcs_numVotesReceived :: !Integer
+    { vcs_votesReceived :: !(Set ServerId)
     }
   deriving ( Show )
 
@@ -298,7 +342,7 @@ data ServerRole
   = Candidate
   | Follower
   | Leader
-  deriving ( Show )
+  deriving ( Eq, Show )
 
 -- | The configuration of the collection of servers.
 --
