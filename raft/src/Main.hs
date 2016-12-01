@@ -19,6 +19,20 @@ main = do
 ----------------------------------------------------------------
 -- * Client
 ----------------------------------------------------------------
+--
+-- Clients send one request at a time, and keep sending it until they
+-- receive a response. We can probably relax this and allow clients to
+-- give up on a request, but they can't resend an earlier request
+-- again after a later request. Each client request includes a request
+-- ID, which should be locally unique for that client (e.g. it can
+-- wrap over long time periods, but requests close together in time
+-- should have different ids).
+--
+-- Clients contact the leader if it's known, and a random server
+-- otherwise. After sending a request and not receiving a response,
+-- they contact a random server, in case the leader died. Followers
+-- redirect clients to the leader, and otherwise ignore client
+-- requests.
 
 ----------------------------------------------------------------
 -- * Server
@@ -39,16 +53,21 @@ main = do
 --
 --     - Sends out heartbeats periodically.
 --
---       - [ ] How is the heartbeat delta determined?
+--       - [X] How is the heartbeat delta determined?
+--
+--         A: I can't find any discussion of this in the paper, but
+--         some fraction of 'minElectionTimeout' should suffice.
 --
 --
 --   - Follower:
 --
 --     - Becomes candidate if heartbeat is not received during timeout.
 --
---       - [ ] How is the heartbeat timeout determined? Iirc it's
+--       - [X] How is the election timeout determined? Iirc it's
 --         randomly chosen, but I don't remember if that's every time,
 --         or once per server (presumably every time ...).
+--
+--         A: going with "every time".
 --
 --   - Candidate:
 --
@@ -75,10 +94,10 @@ main = do
 --   send/receive functions. Unclear if it should be per server or
 --   not, however.
 --
---
+-- ----------------------------------------------------------------
 -- Tasks
 --
--- - [ ] Implement resetable timer loop. E.g., for the leader, want a
+-- - [X] Implement resetable timer loop. E.g., for the leader, want a
 --   loop that determines when to send heartbeats, that is reset for
 --   any other communication with corresponding follower. But to
 --   start, can just send heartbeats regardless of whether they are
@@ -92,6 +111,53 @@ main = do
 --     also restarts if it reaches zero.
 --
 --   - timer can be canceled / reset without firing its event.
+--
+-- - [ ] Track latest client request processed -- with request id and
+--   response -- in state machine state; see Section 8 of paper. For
+--   this we need the property that the client never reuses a request
+--   id until a request with a different id has been processed. But
+--   it's OK to use a finite counter that wraps around.
+--
+--   The assumption is that clients only send one request at a time,
+--   resending periodically if they don't hear back.
+--
+-- ----------------------------------------------------------------
+-- Thoughts on concurrency
+--
+-- I started by coding as if every event were handled concurrently. It
+-- would probably be easier to decide on what concurrency is allowed
+-- -- and this should be the minimum amount that gives sufficient
+-- performance/responsiveness -- and only protect myself from that
+-- amount of concurrency. One pitfall here is that if I want to add
+-- more concurrency later, I may have to change code in more places
+-- when the assumptions change.
+--
+-- A realistic amount of concurrency:
+--
+-- Use synchronized queues to communicate between different event
+-- driven threads. Threads:
+--
+-- - main loop handling rpcs and election events (below). The main
+--   loop sends events to the state machine updater thread, whenever
+--   it observes that 'commitIndex > lastApplied'
+--
+-- - state machine updater (because it could be slow for a complicated
+--   state machine). in the leader, this thread also responds to
+--   clients.
+--
+-- - election timer in followers and candidates that sends election
+--   events to the main loop (e.g. a "start election" event)
+--
+-- - heartbeat timer in leaders. This just sends 'AppendEntries' RPCs
+--   to followers. in fact, this can be the *only* source of
+--   'AppendEntries'. No need to update state (except restart the
+--   timer) here; the main loop can do follower book keeping in when
+--   processing 'AppendEntriesResponse' RPCs.
+--
+-- Important property: at most *one* thread. Here we'll have all
+-- writes in the main loop, except for state machine updates, and
+-- updates to 'lastApplied', which happen in the state machine
+-- updater.
 
 -- | Run a delayed action, returning a handle that can be used to
 -- cancel the delayed action -- using 'CCA.cancel' -- if it has not
