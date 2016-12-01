@@ -3,6 +3,8 @@ module Main where
 import qualified Control.Concurrent as CC
 import           Control.Concurrent.Async ( Async )
 import qualified Control.Concurrent.Async as CCA
+import           Control.Concurrent.Chan ( Chan )
+import qualified Control.Concurrent.Chan as CCC
 import           Control.Concurrent.MVar ( MVar )
 import qualified Control.Concurrent.MVar as CCM
 import qualified Control.Monad as CM
@@ -57,7 +59,6 @@ main = do
 --
 --         A: I can't find any discussion of this in the paper, but
 --         some fraction of 'minElectionTimeout' should suffice.
---
 --
 --   - Follower:
 --
@@ -159,6 +160,10 @@ main = do
 -- updates to 'lastApplied', which happen in the state machine
 -- updater.
 
+----------------------------------------------------------------
+-- * Delayed actions
+----------------------------------------------------------------
+
 -- | Run a delayed action, returning a handle that can be used to
 -- cancel the delayed action -- using 'CCA.cancel' -- if it has not
 -- run yet.
@@ -169,6 +174,46 @@ delayedAction :: Int -> IO () -> IO (Async ())
 delayedAction delay action = do
   CCA.async $ CC.threadDelay delay >> action
 
+cancelTimer :: ServerState cmd -> IO ()
+cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
+
+----------------------------------------------------------------
+-- * Heartbeat timer
+----------------------------------------------------------------
+
+startHeartbeatTimer :: ServerState cmd -> IO ()
+startHeartbeatTimer ss = do
+  -- Not really sure what a good value for the delay is, but this
+  -- seems quite conservative.
+  let delay = minElectionTimeout `div` 5
+  timer <- delayedAction delay $ handleHeartbeatTimeout ss
+  CM.void $ CCM.swapMVar (ss_timer ss) timer
+
+-- | Send all followers any log events they don't have yet.
+--
+-- The empty heartbeats in the paper are the special case where the
+-- follower is completely up to date.
+handleHeartbeatTimeout :: ServerState cmd -> IO ()
+handleHeartbeatTimeout ss = do
+  ps <- CCM.readMVar (ss_persistentState ss)
+  vs <- CCM.readMVar (ss_volatileState ss)
+  Just vls <- CCM.readMVar (ss_volatileLeaderState ss)
+  let sids = c_serverIds . ps_config $ ps
+  CM.forM_ sids $ \sid ->
+    -- HERE
+    sendRpc ss sid $ AppendEntries
+      { r_term = undefined
+      , r_leaderId = undefined
+      , r_prevLogIndex = undefined
+      , r_prevLogTerm = undefined
+      , r_entries = undefined
+      , r_leaderCommit = undefined
+      }
+
+----------------------------------------------------------------
+-- * Election timer
+----------------------------------------------------------------
+
 -- | The election timeout is randomly chosen between 'minElectionTimeout'
 -- and @2 * minElectionTimeout@, on each iteration of the election loop.
 minElectionTimeout :: Int
@@ -178,20 +223,20 @@ startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
   delay <- error "TODO: choose a random election timeout between T and 2*T!"
   timer <- delayedAction delay $ handleElectionTimeout ss
-  CCM.putMVar (ss_timer ss) timer
+  CM.void $ CCM.swapMVar (ss_timer ss) timer
 
 restartElectionTimer :: ServerState cmd -> IO ()
 restartElectionTimer ss = do
-  CCA.cancel =<< CCM.takeMVar (ss_timer ss)
+  cancelTimer ss
   startElectionTimer ss
 
 handleElectionTimeout :: ServerState cmd -> IO ()
 handleElectionTimeout ss = do
-  role <- CCM.takeMVar $ ss_role ss
+  role <- CCM.readMVar $ ss_role ss
   case role of
     Leader -> error "The leader should not be running an election timer!"
-    Follower -> startElection ss
-    Candidate -> startElection ss
+    Follower -> CCC.writeChan (ss_mainQueue ss) StartElection
+    Candidate -> CCC.writeChan (ss_mainQueue ss) StartElection
 
 -- | Start an election with our self as candidate.
 --
@@ -217,7 +262,7 @@ handleElectionTimeout ss = do
 -- 3. If election timeout, try again.
 startElection :: ServerState cmd -> IO ()
 startElection ss = do
-  CCM.putMVar (ss_role ss) Candidate
+  CM.void $ CCM.swapMVar (ss_role ss) Candidate
   incrementTerm
   voteForSelf
   restartElectionTimer ss
@@ -239,7 +284,7 @@ startElection ss = do
           { vcs_votesReceived = Set.singleton $ ps_myServerId ps })
     requestVotes = do
       ps <- CCM.readMVar (ss_persistentState ss)
-      let Entry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
+      let LogEntry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
       let sids = c_serverIds . ps_config $ ps
       CM.forM_ sids $ \sid ->
         sendRpc ss sid $ RequestVote
@@ -248,6 +293,10 @@ startElection ss = do
           , r_lastLogIndex = lastLogIndex
           , r_lastLogTerm = lastLogTerm
           }
+
+----------------------------------------------------------------
+-- * Persistent state
+----------------------------------------------------------------
 
 -- | The persistent state is modified through this function, not
 -- directly by callers of this function, so that we can handle
@@ -269,13 +318,29 @@ modifyPersistentState ss f = do
 -- | Send an RPC to another server.
 sendRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
 sendRpc ss sid rpc = do
+  -- Plan: have a mapping from 'ServerId' to 'ServerState' and put the
+  -- rpc on the corresponding main loop queue.
   undefined ss sid rpc
+
+----------------------------------------------------------------
+-- * Main event loop
+----------------------------------------------------------------
+
+mainLoop :: ServerState cmd -> IO ()
+mainLoop ss = do
+  me <- CCC.readChan (ss_mainQueue ss)
+  handleMainEvent ss me
+  mainLoop ss
+
+handleMainEvent :: ServerState cmd -> MainEvent cmd -> IO ()
+handleMainEvent ss (Rpc rpc) = handleRpc ss rpc
+handleMainEvent ss StartElection = startElection ss
 
 -- | Receive an RPC from another server.
 --
--- This is the main the loop, in the form of an event handler.
-receiveRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
-receiveRpc ss sid rpc = do
+-- This is the part of the main loop that processes RPCs.
+handleRpc :: ServerState cmd -> Rpc cmd -> IO ()
+handleRpc ss rpc = do
   case rpc of
     AppendEntries {} -> undefined
     AppendEntriesResponse {} -> undefined
@@ -302,9 +367,9 @@ receiveRpc ss sid rpc = do
       CM.when (role == Candidate &&
             r_voteGranted rpc &&
             r_term rpc == ps_currentTerm ps) $ do
-        Just vcs <- CCM.takeMVar (ss_volatileCandidateState ss)
-        let votes = Set.insert sid (vcs_votesReceived vcs)
-        CCM.putMVar (ss_volatileCandidateState ss)
+        Just vcs <- CCM.readMVar (ss_volatileCandidateState ss)
+        let votes = Set.insert (ps_myServerId ps) (vcs_votesReceived vcs)
+        CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
           (Just $ vcs { vcs_votesReceived = votes })
         let numServers = length . c_serverIds . ps_config $ ps
         let numVotes = Set.size votes
@@ -337,12 +402,12 @@ type Index = Integer
 -- type could be
 --
 -- > data KvCmd = Get Key | Put Key Value
-data Entry cmd = Entry Index Term cmd
+data LogEntry cmd = LogEntry Index Term cmd
   deriving ( Show )
 
 {-
 data KvCmd = Get Key | Put Key Value
-type KvEntry = Entry KvCmd
+type KvLogEntry = LogEntry KvCmd
 -}
 
 data PersistentState cmd
@@ -350,7 +415,7 @@ data PersistentState cmd
     { ps_currentTerm :: !Term
     , ps_votedFor :: !ServerId
       -- Use something more efficient later.
-    , ps_log :: ![Entry cmd]
+    , ps_log :: ![LogEntry cmd]
       -- Id of this server.
     , ps_myServerId :: !ServerId
       -- Persistent in case we implement live configuration changes
@@ -385,7 +450,7 @@ data Rpc cmd
     , r_leaderId :: !ServerId
     , r_prevLogIndex :: !Index
     , r_prevLogTerm :: !Term
-    , r_entries :: ![Entry cmd]
+    , r_entries :: ![LogEntry cmd]
     , r_leaderCommit :: !Index
     }
   | AppendEntriesResponse
@@ -421,17 +486,32 @@ data Config
     }
   deriving ( Show )
 
+-- | Event for the main queue.
+data MainEvent cmd
+  = Rpc (Rpc cmd)
+  | StartElection
+  deriving ( Show )
+
+-- | Event for the state machine queue.
+data SMEvent
+  = UpdateSM
+  deriving ( Show )
+
 -- | All of the server state.
 --
--- Need to add the volatile and persistent state here, the special
--- leader state, etc.
---
--- I'm threading the state manually below ...
+-- I'm using 'MVar's everywhere, but most of them have a single
+-- writer; I could change those to 'IORef's, but I don't see the
+-- benefit.
 data ServerState cmd
   = ServerState
-      -- Expect contention on the timer.
     { ss_timer :: !(MVar (Async ()))
-      -- Not sure about contention on the role yet.
+      -- ^ Cancelable action that runs after a delay. This variable
+      -- has multiple writers, but we could just as well use an
+      -- 'IORef' here as writes correspond to restarting the timer.
+    , ss_mainQueue :: !(Chan (MainEvent cmd))
+      -- ^ Main loop event queue.
+    , ss_smQueue :: !(Chan SMEvent)
+      -- ^ State machine event queue.
     , ss_role :: !(MVar ServerRole)
     , ss_persistentState :: !(MVar (PersistentState cmd))
     , ss_volatileState :: !(MVar VolatileState)
