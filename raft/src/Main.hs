@@ -114,6 +114,16 @@ main = do
 --
 --   - timer can be canceled / reset without firing its event.
 --
+-- - [ ] Implement server initialization code.
+--
+--   - [ ] Initial state.
+--
+--   - [ ] Initial config.
+--
+--   - [ ] Setup whatever 'sendRpc' needs.
+--
+-- - [ ] Implement state machine updater event loop.
+--
 -- - [ ] Track latest client request processed -- with request id and
 --   response -- in state machine state; see Section 8 of paper. For
 --   this we need the property that the client never reuses a request
@@ -158,7 +168,7 @@ main = do
 -- - heartbeat timer in leaders. This just sends 'AppendEntries' RPCs
 --   to followers. In fact, this can be the *only* source of
 --   'AppendEntries'. No need to update state (except restart the
---   timer) here; the main loop can do follower book keeping in when
+--   timer) here; the main loop can do follower book keeping when
 --   processing 'AppendEntriesResponse' RPCs.
 --
 -- Important property: at most *one* thread *writes* each piece of
@@ -181,17 +191,22 @@ main = do
 --   it happens automatically.
 --
 -- - (+) state updates in other threads happen sooner: if we queued
---   state updates, then there could be many intermediate events -
---   between the event that triggered a state update and the event -
+--   state updates, then there could be many intermediate events
+--   between the event that triggered a state update and the event
 --   that committed it in another thread.
 --
 -- - (-) introduces concurrent updates in other threads, which could
 --   cause bugs if we're not careful.
 --
--- Best of both worlds (?): use mutable vars, but also use a state
--- monad, and read current value of all state at the beginning of
--- handling each queue event in each thread. Then updates happen
--- automatically, but only at predictable times.
+-- Best of both worlds (?): use mutable vars, but also use a state or
+-- reader monad, and read current value of all mutable var state at
+-- the beginning of handling each queue event in each thread. Then
+-- mutable var updates happen automatically, but only at predictable
+-- times (i.e. at the beginning of handling each queue event). A
+-- potential downside here is that keeping track of updates to mutable
+-- vars would be more complicated: in writer threads, we now have two
+-- copies of the mutable state, one in the state/reader monad and one
+-- in the 'MVar's.
 
 ----------------------------------------------------------------
 -- * Delayed actions
@@ -310,7 +325,7 @@ startElection ss = do
         (\ps -> ps { ps_currentTerm = 1 + ps_currentTerm ps })
     voteForSelf = do
       modifyPersistentState ss $ \ps ->
-        ps { ps_votedFor = ps_myServerId ps }
+        ps { ps_votedFor = Just $ ps_myServerId ps }
       ps <- CCM.readMVar (ss_persistentState ss)
       -- Initialize the volatile candidate state and count our self
       -- vote. If we add more fields to the volatile candidate state,
@@ -375,14 +390,73 @@ handleMainEvent ss StartElection = startElection ss
 -- | Receive an RPC from another server.
 --
 -- This is the part of the main loop that processes RPCs.
+--
+-- With all RPCs, if the term in the RPC is greater than our term,
+-- then we should update our term and become a follower.
 handleRpc :: ServerState cmd -> Rpc cmd -> IO ()
 handleRpc ss rpc = do
   case rpc of
     AppendEntries {} -> undefined
     AppendEntriesResponse {} -> undefined
-    RequestVote {} -> undefined
+    RequestVote {} -> handleRequestVote
     RequestVoteResponse {} -> handleRequestVoteResponse
   where
+    -- Cases to consider:
+    --
+    -- - rpc term is older than our current term: reject.
+    --
+    -- - rpc term is equal to our current term: check to see if we've
+    --   already voted, and vote accordingly.
+    --
+    -- - rpc term is greater than our current term: revert to
+    --   follower, clear 'ps_votedFor', and vote accordingly.
+    --
+    -- Above "vote accordingly" means to be consistent with any
+    -- existing vote and check the "at least as up to date as"
+    -- property for new votes.
+    handleRequestVote = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      case r_term rpc `compare` ps_currentTerm ps of
+        LT -> sendRpc ss (r_candidateId rpc)
+              RequestVoteResponse
+              { r_term = ps_currentTerm ps
+              , r_voteGranted = False
+              , r_responderId = ps_myServerId ps
+              }
+        EQ -> voteAccordingly
+        GT -> do
+          becomeFollower ss (r_term rpc)
+          voteAccordingly
+    -- Assumes that current term and rpc term are the same. The
+    -- @becomeFollower@ takes care of this.
+    voteAccordingly = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      case ps_votedFor ps of
+        -- Already voted.
+        Just voteId -> sendRpc ss (r_candidateId rpc)
+                    RequestVoteResponse
+                    { r_term = r_term rpc
+                    , r_voteGranted = voteId == r_candidateId rpc
+                    , r_responderId = ps_myServerId ps
+                    }
+        -- Haven't voted.
+        Nothing -> do
+          -- See Figure 2 and end of Section 5.4.1.
+          let candidateIsUpToDate =
+                let LogEntry lastLogIndex lastLogTerm _ = last $ ps_log ps
+                in r_lastLogTerm rpc > lastLogTerm ||
+                   ( r_lastLogTerm rpc == lastLogTerm &&
+                     r_lastLogIndex rpc >= lastLogIndex )
+          CM.when candidateIsUpToDate $ do
+            modifyPersistentState ss $ \ps ->
+              ps { ps_votedFor = Just $ r_candidateId rpc }
+          sendRpc ss (r_candidateId rpc)
+            RequestVoteResponse
+            { r_term = r_term rpc
+            , r_voteGranted = candidateIsUpToDate
+            , r_responderId = ps_myServerId ps
+            }
+
     -- Cases to consider:
     --
     -- - vote was granted and vote term is equal to our term: count
@@ -412,6 +486,14 @@ handleRpc ss rpc = do
         -- Become leader if a majority of servers voted for us.
         CM.when (2 * numVotes > numServers) $
           becomeLeader ss
+
+becomeFollower :: ServerState cmd -> Term -> IO ()
+becomeFollower ss term = do
+  CM.void $ CCM.swapMVar (ss_role ss) Follower
+  modifyPersistentState ss $ \ps ->
+    ps { ps_votedFor = Nothing
+       , ps_currentTerm = term
+       }
 
 -- | Become a leader.
 --
@@ -464,7 +546,7 @@ type KvLogEntry = LogEntry KvCmd
 data PersistentState cmd
   = PersistentState
     { ps_currentTerm :: !Term
-    , ps_votedFor :: !ServerId
+    , ps_votedFor :: !(Maybe ServerId)
       -- | Raft uses 1-based log indexing, and @(0,0)@ is the
       -- @(index,term)@ for the entry before the first. So, we assume
       -- that 'ps_log' has been initialized with an initial dummy
