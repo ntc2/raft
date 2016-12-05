@@ -219,28 +219,31 @@ startHeartbeatTimer ss = do
   -- Not really sure what a good value for the delay is, but this
   -- seems quite conservative.
   let delay = minElectionTimeout `div` 5
-  timer <- delayedAction delay $ handleHeartbeatTimeout ss
+  timer <- delayedAction delay $ sendAppendEntriesToAllFollowers ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
 
 -- | Send all followers any log events they don't have yet.
 --
 -- The empty heartbeats in the paper are the special case where the
 -- follower is completely up to date.
-handleHeartbeatTimeout :: ServerState cmd -> IO ()
-handleHeartbeatTimeout ss = do
+sendAppendEntriesToAllFollowers :: ServerState cmd -> IO ()
+sendAppendEntriesToAllFollowers ss = do
   ps <- CCM.readMVar (ss_persistentState ss)
   vs <- CCM.readMVar (ss_volatileState ss)
   Just vls <- CCM.readMVar (ss_volatileLeaderState ss)
-  let sids = c_serverIds . ps_config $ ps
-  CM.forM_ sids $ \sid ->
-    -- HERE
+  let sids = c_otherServerIds . ps_config $ ps
+  CM.forM_ sids $ \sid -> do
+    -- Figure out what entries the follower doesn't have yet.
+    let Just nextIndex = fromIntegral <$> Map.lookup sid (vls_nextIndex vls)
+    let entries = drop nextIndex $ ps_log ps
+    let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
     sendRpc ss sid $ AppendEntries
-      { r_term = undefined
-      , r_leaderId = undefined
-      , r_prevLogIndex = undefined
-      , r_prevLogTerm = undefined
-      , r_entries = undefined
-      , r_leaderCommit = undefined
+      { r_term = ps_currentTerm ps
+      , r_leaderId = ps_myServerId ps
+      , r_prevLogIndex = prevLogIndex
+      , r_prevLogTerm = prevLogTerm
+      , r_entries = entries
+      , r_leaderCommit = vs_commitIndex vs
       }
 
 ----------------------------------------------------------------
