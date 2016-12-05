@@ -123,6 +123,11 @@ main = do
 --   The assumption is that clients only send one request at a time,
 --   resending periodically if they don't hear back.
 --
+-- - [ ] use 'Data.Sequence' instead of a linked list for the event
+--   log 'ps_log'. Note that 'Data.Vector' is not a good choice here,
+--   since we want efficient lookups and appends, and appends are
+--   @O(n)@ for 'Data.Vector'.
+--
 -- ----------------------------------------------------------------
 -- Thoughts on concurrency
 --
@@ -144,22 +149,49 @@ main = do
 --   it observes that 'commitIndex > lastApplied'
 --
 -- - state machine updater (because it could be slow for a complicated
---   state machine). in the leader, this thread also responds to
+--   state machine). In the leader, this thread also responds to
 --   clients.
 --
 -- - election timer in followers and candidates that sends election
 --   events to the main loop (e.g. a "start election" event)
 --
 -- - heartbeat timer in leaders. This just sends 'AppendEntries' RPCs
---   to followers. in fact, this can be the *only* source of
+--   to followers. In fact, this can be the *only* source of
 --   'AppendEntries'. No need to update state (except restart the
 --   timer) here; the main loop can do follower book keeping in when
 --   processing 'AppendEntriesResponse' RPCs.
 --
--- Important property: at most *one* thread. Here we'll have all
--- writes in the main loop, except for state machine updates, and
--- updates to 'lastApplied', which happen in the state machine
--- updater.
+-- Important property: at most *one* thread *writes* each piece of
+-- state. Here we'll have all writes in the main loop, except for
+-- state machine updates, and updates to 'lastApplied', which happen
+-- in the state machine updater.
+--
+-- We could enforce this "single writer" property more formally by not
+-- sharing any mutable state between the different threads: rather,
+-- the threads that write state could compute the new values, and then
+-- broadcast these new values back to the other reader threads. Each
+-- thread could then use a state monad, and update values written by
+-- other threads when the new values arrive in the queue for the given
+-- thread.
+--
+-- Trade offs when using mutable vars (e.g. 'IORef's, 'MVar's,
+-- 'TVar's) for single-writer mutable state:
+--
+-- - (+) easier to communicate state updates to other threads, since
+--   it happens automatically.
+--
+-- - (+) state updates in other threads happen sooner: if we queued
+--   state updates, then there could be many intermediate events -
+--   between the event that triggered a state update and the event -
+--   that committed it in another thread.
+--
+-- - (-) introduces concurrent updates in other threads, which could
+--   cause bugs if we're not careful.
+--
+-- Best of both worlds (?): use mutable vars, but also use a state
+-- monad, and read current value of all state at the beginning of
+-- handling each queue event in each thread. Then updates happen
+-- automatically, but only at predictable times.
 
 ----------------------------------------------------------------
 -- * Delayed actions
@@ -416,11 +448,16 @@ data PersistentState cmd
   = PersistentState
     { ps_currentTerm :: !Term
     , ps_votedFor :: !ServerId
-      -- Use something more efficient later.
+      -- | Raft uses 1-based log indexing, and @(0,0)@ is the
+      -- @(index,term)@ for the entry before the first. So, we assume
+      -- that 'ps_log' has been initialized with an initial dummy
+      -- 'LogEntry' with index and term equal to 0, and a dummy
+      -- command. This eliminates special cases involving the log
+      -- entry at index 1, i.e. the first real log entry.
     , ps_log :: ![LogEntry cmd]
-      -- Id of this server.
+      -- | Id of this server.
     , ps_myServerId :: !ServerId
-      -- Persistent in case we implement live configuration changes
+      -- | Persistent in case we implement live configuration changes
       -- later.
     , ps_config :: !Config
     }
