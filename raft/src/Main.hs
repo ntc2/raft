@@ -12,6 +12,7 @@ import           Data.Map.Strict ( Map )
 import qualified Data.Map.Strict as Map
 import           Data.Set ( Set )
 import qualified Data.Set as Set
+import qualified System.Random as SR
 
 main :: IO ()
 main = do
@@ -168,8 +169,8 @@ main = do
 -- cancel the delayed action -- using 'CCA.cancel' -- if it has not
 -- run yet.
 --
--- - delay: time to delay in milliseconds.
--- - action: the action to run after the delay.
+-- - @delay@: time to delay in milliseconds.
+-- - @action@: the action to run after the delay.
 delayedAction :: Int -> IO () -> IO (Async ())
 delayedAction delay action = do
   CCA.async $ CC.threadDelay delay >> action
@@ -221,7 +222,7 @@ minElectionTimeout = 150 -- Paper suggestion.
 
 startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
-  delay <- error "TODO: choose a random election timeout between T and 2*T!"
+  delay <- SR.randomRIO (minElectionTimeout, 2 * minElectionTimeout)
   timer <- delayedAction delay $ handleElectionTimeout ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
 
