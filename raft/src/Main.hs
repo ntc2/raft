@@ -286,7 +286,7 @@ startElection ss = do
     requestVotes = do
       ps <- CCM.readMVar (ss_persistentState ss)
       let LogEntry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
-      let sids = c_serverIds . ps_config $ ps
+      let sids = c_otherServerIds . ps_config $ ps
       CM.forM_ sids $ \sid ->
         sendRpc ss sid $ RequestVote
           { r_term = ps_currentTerm ps
@@ -369,11 +369,12 @@ handleRpc ss rpc = do
             r_voteGranted rpc &&
             r_term rpc == ps_currentTerm ps) $ do
         Just vcs <- CCM.readMVar (ss_volatileCandidateState ss)
-        let votes = Set.insert (ps_myServerId ps) (vcs_votesReceived vcs)
+        let votes = Set.insert (r_responderId rpc) (vcs_votesReceived vcs)
         CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
           (Just $ vcs { vcs_votesReceived = votes })
-        let numServers = length . c_serverIds . ps_config $ ps
+        let numServers = (1 +) . length . c_otherServerIds . ps_config $ ps
         let numVotes = Set.size votes
+        -- Become leader if a majority of servers voted for us.
         CM.when (2 * numVotes > numServers) $
           becomeLeader ss
 
@@ -457,6 +458,7 @@ data Rpc cmd
   | AppendEntriesResponse
     { r_term :: !Term
     , r_success :: !Bool
+    , r_responderId :: !ServerId -- ^ Not in paper.
     }
   | RequestVote
     { r_term :: !Term
@@ -467,6 +469,7 @@ data Rpc cmd
   | RequestVoteResponse
     { r_term :: !Term
     , r_voteGranted :: !Bool
+    , r_responderId :: !ServerId -- ^ Not in paper.
     }
   deriving ( Show )
 
@@ -483,7 +486,8 @@ data ServerRole
 -- life of the servers.
 data Config
   = Config
-    { c_serverIds :: ![ServerId] -- ^ The set of all server ids.
+    { c_otherServerIds :: ![ServerId]
+      -- ^ The set of server IDs for all servers *not* including us.
     }
   deriving ( Show )
 
