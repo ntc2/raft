@@ -412,10 +412,24 @@ handleRpc ss rpc = do
 
 -- | Become a leader.
 --
--- See page 4 ...
+-- See page 4.
 becomeLeader :: ServerState cmd -> IO ()
 becomeLeader ss = do
-  undefined
+  startHeartbeatTimer ss
+  initializeVolatileLeaderState
+  CM.void $ CCM.swapMVar (ss_role ss) Leader
+  sendAppendEntriesToAllFollowers ss
+  where
+    initializeVolatileLeaderState = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      let sids = c_otherServerIds . ps_config $ ps
+      let constMap v = Map.fromList [ (s, v) | s <- sids ]
+      let LogEntry lastLogEntryIndex _ _ = last $ ps_log ps
+      CM.void $ CCM.swapMVar (ss_volatileLeaderState ss) $
+        Just $ VolatileLeaderState
+        { vls_nextIndex = constMap (lastLogEntryIndex + 1)
+        , vls_matchIndex = constMap 0
+        }
 
 ----------------------------------------------------------------
 -- * Types
