@@ -1,4 +1,8 @@
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Main where
 
 import qualified Control.Concurrent as CC
@@ -551,6 +555,11 @@ data KvCmd = Get Key | Put Key Value
 type KvLogEntry = LogEntry KvCmd
 -}
 
+-- | State-machine state.
+--
+-- Depends on the underlying commands.
+type family SmState cmd :: *
+
 data PersistentState cmd
   = PersistentState
     { ps_currentTerm :: !Term
@@ -570,12 +579,13 @@ data PersistentState cmd
     }
   deriving ( Show )
 
-data VolatileState
+data VolatileState cmd
   = VolatileState
     { vs_commitIndex :: !Index
     , vs_lastApplied :: !Index
+    , vs_smState :: !(SmState cmd)
     }
-  deriving ( Show )
+deriving instance Show (SmState cmd) => Show (VolatileState cmd)
 
 data VolatileLeaderState
   = VolatileLeaderState
@@ -663,7 +673,7 @@ data ServerState cmd
       -- ^ State machine event queue.
     , ss_role :: !(MVar ServerRole)
     , ss_persistentState :: !(MVar (PersistentState cmd))
-    , ss_volatileState :: !(MVar VolatileState)
+    , ss_volatileState :: !(MVar (VolatileState cmd))
     , ss_volatileLeaderState :: !(MVar (Maybe VolatileLeaderState))
     , ss_volatileCandidateState :: !(MVar (Maybe VolatileCandidateState))
     }
