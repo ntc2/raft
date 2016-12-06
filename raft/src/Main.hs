@@ -490,14 +490,23 @@ handleRpc ss rpc = do
         CM.when (2 * numVotes > numServers) $
           becomeLeader ss
 
+-- | Become follower in given term.
+--
+-- If the new term is the same as the old term, then we preserve any
+-- existing vote. Otherwise, we reset our vote to 'Nothing'.
 becomeFollower :: ServerState cmd -> Term -> IO ()
-becomeFollower ss term = do
+becomeFollower ss newTerm = do
   startElectionTimer ss
   CM.void $ CCM.swapMVar (ss_role ss) Follower
-  modifyPersistentState ss $ \ps ->
-    ps { ps_votedFor = Nothing
-       , ps_currentTerm = term
-       }
+  currentTerm <- ps_currentTerm <$> CCM.readMVar (ss_persistentState ss)
+  case currentTerm `compare` newTerm of
+    LT -> modifyPersistentState ss $ \ps ->
+      ps { ps_votedFor = Nothing
+         , ps_currentTerm = newTerm
+         }
+    -- We preserve our vote, and the term is already correct.
+    EQ -> return ()
+    GT -> error "becomeFollower: newTerm is in the past!"
 
 -- | Become a leader.
 --
