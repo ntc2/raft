@@ -250,23 +250,28 @@ startHeartbeatTimer ss = do
 sendAppendEntriesToAllFollowers :: ServerState cmd -> IO ()
 sendAppendEntriesToAllFollowers ss = do
   ps <- CCM.readMVar (ss_persistentState ss)
-  vs <- CCM.readMVar (ss_volatileState ss)
-  Just vls <- CCM.readMVar (ss_volatileLeaderState ss)
   let sids = c_otherServerIds . ps_config $ ps
   CM.forM_ sids $ \sid -> do
-    -- Figure out what entries the follower doesn't have yet.
-    let Just nextIndex =
-          fromIntegral . unIndex <$> Map.lookup sid (vls_nextIndex vls)
-    let entries = drop nextIndex $ ps_log ps
-    let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
-    sendRpc ss sid $ AppendEntries
-      { r_term = ps_currentTerm ps
-      , r_leaderId = ps_myServerId ps
-      , r_prevLogIndex = prevLogIndex
-      , r_prevLogTerm = prevLogTerm
-      , r_entries = entries
-      , r_leaderCommit = vs_commitIndex vs
-      }
+    sendAppendEntriesToOneFollower ss sid
+
+sendAppendEntriesToOneFollower :: ServerState cmd -> ServerId -> IO ()
+sendAppendEntriesToOneFollower ss sid = do
+  ps <- CCM.readMVar (ss_persistentState ss)
+  vs <- CCM.readMVar (ss_volatileState ss)
+  Just vls <- CCM.readMVar (ss_volatileLeaderState ss)
+  -- Figure out what entries the follower doesn't have yet.
+  let Just nextIndex =
+        fromIntegral . unIndex <$> Map.lookup sid (vls_nextIndex vls)
+  let entries = drop nextIndex $ ps_log ps
+  let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
+  sendRpc ss sid $ AppendEntries
+    { r_term = ps_currentTerm ps
+    , r_leaderId = ps_myServerId ps
+    , r_prevLogIndex = prevLogIndex
+    , r_prevLogTerm = prevLogTerm
+    , r_entries = entries
+    , r_leaderCommit = vs_commitIndex vs
+    }
 
 ----------------------------------------------------------------
 -- * Election timer
