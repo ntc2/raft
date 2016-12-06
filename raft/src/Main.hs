@@ -1,3 +1,4 @@
+{-# LANGUAGE GeneralizedNewtypeDeriving #-}
 module Main where
 
 import qualified Control.Concurrent as CC
@@ -249,7 +250,8 @@ sendAppendEntriesToAllFollowers ss = do
   let sids = c_otherServerIds . ps_config $ ps
   CM.forM_ sids $ \sid -> do
     -- Figure out what entries the follower doesn't have yet.
-    let Just nextIndex = fromIntegral <$> Map.lookup sid (vls_nextIndex vls)
+    let Just nextIndex =
+          fromIntegral . unIndex <$> Map.lookup sid (vls_nextIndex vls)
     let entries = drop nextIndex $ ps_log ps
     let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
     sendRpc ss sid $ AppendEntries
@@ -520,7 +522,11 @@ becomeLeader ss = do
 -- * Types
 ----------------------------------------------------------------
 
-type Term = Integer
+-- | Use a @newtype@ to decrease the chance of accidentally
+-- interchanging a 'Term' and an 'Index', since they are both
+-- 'Integer' and used in similar places.
+newtype Term = Term { unTerm :: Integer }
+  deriving ( Eq, Num, Ord, Show )
 -- | Treat this opaquely, so I can change it later, e.g. to add
 -- networking. Or, could always use integers to represent server ids,
 -- and have a separate abstraction that contacts servers using their
@@ -528,7 +534,9 @@ type Term = Integer
 --
 -- > send :: ServerId -> RPC -> m ()
 type ServerId = Integer
-type Index = Integer
+-- | See 'Term' above.
+newtype Index = Index { unIndex :: Integer }
+  deriving ( Eq, Num, Ord, Show )
 
 -- | Log entries are parameterized by the command type @cmd@. E.g.,
 -- for a key-value store service as used in the paper, the command
