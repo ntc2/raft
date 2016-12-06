@@ -399,11 +399,96 @@ handleMainEvent ss StartElection = startElection ss
 handleRpc :: ServerState cmd -> Rpc cmd -> IO ()
 handleRpc ss rpc = do
   case rpc of
-    AppendEntries {} -> undefined
+    AppendEntries {} -> handleAppendEntries
     AppendEntriesResponse {} -> undefined
     RequestVote {} -> handleRequestVote
     RequestVoteResponse {} -> handleRequestVoteResponse
   where
+    -- Cases to consider:
+    --
+    -- - rpc term is older than our current term: reject.
+    --
+    -- - rpc term is equal to our current term:
+    --
+    --   - if we're a candidate, then assume a new leader has been
+    --     elected and become a follower. Then handle as in follower
+    --     case below.
+    --
+    --   - if we're a leader, then the sky is falling.
+    --
+    --   - if we're a follower, then implement "receiver
+    --     implementation" in Figure 2.
+    --
+    -- - rpc term is newer than our current term:
+    --
+    --   - become a follower and implement "receiver implementation"
+    --     in Figure 2.
+    handleAppendEntries = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      role <- CCM.readMVar (ss_role ss)
+      case r_term rpc `compare` ps_currentTerm ps of
+        LT -> sendRpc ss (r_leaderId rpc)
+              AppendEntriesResponse
+              { r_term = ps_currentTerm ps
+              , r_success = False
+              , r_responderId = ps_myServerId ps
+              }
+        EQ | role == Leader -> do
+               error "handleAppendEntries: there are two leaders!"
+           | role == Candidate -> do
+               becomeFollower ss (r_term rpc)
+               handleAppendEntriesForCurrentTermAsFollower
+           | role == Follower -> do
+               handleAppendEntriesForCurrentTermAsFollower
+        GT -> do
+          becomeFollower ss (r_term rpc)
+          handleAppendEntriesForCurrentTermAsFollower
+    -- Handle append-entries rpc for case where we believe the rpc is
+    -- from the current leader and our term is (now) equal to the
+    -- rpc's term.
+    handleAppendEntriesForCurrentTermAsFollower = do
+      ps <- CCM.readMVar (ss_persistentState ss)
+      let lastLogIndex = le_index . last . ps_log $ ps
+      let r_prevLogIndex' =
+            fromIntegral . unIndex . r_prevLogIndex $ rpc
+      -- Making essential use of laziness here: this entry is out of
+      -- bounds when `maxLogIndex` is less than `r_prevLogIndex rpc`.
+      let LogEntry prevLogIndex prevLogTerm _ =
+            ps_log ps !! r_prevLogIndex'
+      if lastLogIndex < r_prevLogIndex rpc ||
+         prevLogIndex /= r_prevLogIndex rpc ||
+         prevLogTerm /= r_prevLogTerm rpc
+        then do
+        -- Can optimize here by sending back more information to
+        -- leader that allows them to do better than simply
+        -- decrementing `r_prevLogIndex` by one; see the end of
+        -- Section 5.3. However, the paper says this optimization is
+        -- not useful in practice.
+        sendRpc ss (r_leaderId rpc)
+          AppendEntriesResponse
+          { r_term = r_term rpc
+          , r_success = False
+          , r_responderId = ps_myServerId ps
+          }
+        else do
+        let newLog = take (r_prevLogIndex' + 1) (ps_log ps) ++
+                     r_entries rpc
+        modifyPersistentState ss $ \ps -> ps { ps_log = newLog }
+        vs <- CCM.readMVar (ss_volatileState ss)
+        CM.when (r_leaderCommit rpc > vs_commitIndex vs) $ do
+          let newLastLogIndex = le_index $ last newLog
+          CM.void $ CCM.swapMVar (ss_volatileState ss) $
+            vs { vs_commitIndex = r_leaderCommit rpc `min`
+                                  newLastLogIndex
+               }
+          CCC.writeChan (ss_smQueue ss) UpdateSM
+        sendRpc ss (r_leaderId rpc)
+          AppendEntriesResponse
+          { r_term = r_term rpc
+          , r_success = True
+          , r_responderId = ps_myServerId ps
+          }
+
     -- Cases to consider:
     --
     -- - rpc term is older than our current term: reject.
@@ -554,7 +639,12 @@ newtype Index = Index { unIndex :: Integer }
 -- type could be
 --
 -- > data KvCmd = Get Key | Put Key Value
-data LogEntry cmd = LogEntry Index Term cmd
+data LogEntry cmd =
+  LogEntry
+  { le_index :: !Index
+  , le_term :: !Term
+  , le_cmd :: !cmd
+  }
   deriving ( Show )
 
 {-
