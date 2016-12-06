@@ -236,6 +236,7 @@ cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
 
 startHeartbeatTimer :: ServerState cmd -> IO ()
 startHeartbeatTimer ss = do
+  cancelTimer ss
   -- Not really sure what a good value for the delay is, but this
   -- seems quite conservative.
   let delay = minElectionTimeout `div` 5
@@ -278,14 +279,10 @@ minElectionTimeout = 150 -- Paper suggestion.
 
 startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
+  cancelTimer ss
   delay <- SR.randomRIO (minElectionTimeout, 2 * minElectionTimeout)
   timer <- delayedAction delay $ handleElectionTimeout ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
-
-restartElectionTimer :: ServerState cmd -> IO ()
-restartElectionTimer ss = do
-  cancelTimer ss
-  startElectionTimer ss
 
 handleElectionTimeout :: ServerState cmd -> IO ()
 handleElectionTimeout ss = do
@@ -322,7 +319,7 @@ startElection ss = do
   CM.void $ CCM.swapMVar (ss_role ss) Candidate
   incrementTerm
   voteForSelf
-  restartElectionTimer ss
+  startElectionTimer ss
   requestVotes
   where
     incrementTerm =
@@ -495,6 +492,7 @@ handleRpc ss rpc = do
 
 becomeFollower :: ServerState cmd -> Term -> IO ()
 becomeFollower ss term = do
+  startElectionTimer ss
   CM.void $ CCM.swapMVar (ss_role ss) Follower
   modifyPersistentState ss $ \ps ->
     ps { ps_votedFor = Nothing
