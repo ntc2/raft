@@ -405,7 +405,7 @@ handleRpc :: ServerState cmd -> Rpc cmd -> IO ()
 handleRpc ss rpc = do
   case rpc of
     AppendEntries {} -> handleAppendEntries
-    AppendEntriesResponse {} -> undefined
+    AppendEntriesResponse {} -> handleAppendEntriesResponse
     RequestVote {} -> handleRequestVote
     RequestVoteResponse {} -> handleRequestVoteResponse
   where
@@ -437,6 +437,8 @@ handleRpc ss rpc = do
               { r_term = ps_currentTerm ps
               , r_success = False
               , r_responderId = ps_myServerId ps
+                -- This field is not meaningful in this case.
+              , r_nextLogIndex = r_lastLogIndex rpc
               }
         EQ | role == Leader -> do
                error "handleAppendEntries: there are two leaders!"
@@ -474,14 +476,16 @@ handleRpc ss rpc = do
           { r_term = r_term rpc
           , r_success = False
           , r_responderId = ps_myServerId ps
+          -- This is the non-optimized part.
+          , r_nextLogIndex = r_lastLogIndex rpc
           }
         else do
         let newLog = take (r_prevLogIndex' + 1) (ps_log ps) ++
                      r_entries rpc
         modifyPersistentState ss $ \ps -> ps { ps_log = newLog }
         vs <- CCM.readMVar (ss_volatileState ss)
+        let newLastLogIndex = le_index $ last newLog
         CM.when (r_leaderCommit rpc > vs_commitIndex vs) $ do
-          let newLastLogIndex = le_index $ last newLog
           CM.void $ CCM.swapMVar (ss_volatileState ss) $
             vs { vs_commitIndex = r_leaderCommit rpc `min`
                                   newLastLogIndex
@@ -492,7 +496,51 @@ handleRpc ss rpc = do
           { r_term = r_term rpc
           , r_success = True
           , r_responderId = ps_myServerId ps
+          , r_nextLogIndex = newLastLogIndex + 1
           }
+
+    -- Cases to consider:
+    --
+    -- - we're not the leader: ignore.
+    --
+    -- - success field is false: check term field, revert to follower
+    --   if greater than current term, and decrement last index for
+    --   responder if equal to current term.
+    --
+    -- - success field is true: check term field and update volatile
+    --   leader state match index and last index if equal to current
+    --   term.
+    handleAppendEntriesResponse = do
+      role <- CCM.readMVar (ss_role ss)
+      ps <- CCM.readMVar (ss_persistentState ss)
+      case role of
+        Leader -> do
+          Just vls <- CCM.readMVar (ss_volatileLeaderState ss)
+          if r_success rpc
+            then do
+            CM.when (r_term rpc == ps_currentTerm ps) $ do
+              let nextIndex' = Map.insert (r_responderId rpc)
+                               (1 + r_lastLogIndex rpc)
+                               (vls_nextIndex vls)
+              let matchIndex' = Map.insert (r_responderId rpc)
+                                (r_lastLogIndex rpc)
+                                (vls_matchIndex vls)
+              CM.void $ CCM.swapMVar (ss_volatileLeaderState ss) $
+                Just $ vls { vls_nextIndex = nextIndex'
+                           , vls_matchIndex = matchIndex'
+                           }
+            else
+            case r_term rpc `compare` ps_currentTerm ps of
+              LT -> return ()
+              EQ -> do
+                let nextIndex' = Map.update (Just . subtract 1)
+                                 (r_responderId rpc)
+                                 (vls_nextIndex vls)
+                CM.void $ CCM.swapMVar (ss_volatileLeaderState ss) $
+                  Just $ vls { vls_nextIndex = nextIndex' }
+                sendAppendEntriesToOneFollower ss (r_responderId rpc)
+              GT -> becomeFollower ss (r_term rpc)
+        _ -> return ()
 
     -- Cases to consider:
     --
@@ -715,6 +763,13 @@ data Rpc cmd
     { r_term :: !Term
     , r_success :: !Bool
     , r_responderId :: !ServerId -- ^ Not in paper.
+    , r_nextLogIndex :: !Index
+      -- ^ Not in paper. In successful responses, this is the index of
+      -- the next log entry the leader should try to send us. In
+      -- unsuccessful responses, this field is set to the index before
+      -- `r_lastLogIndex` in the rpc, but but could be used to
+      -- implement an optimization; see comments in
+      -- 'handleAppendEntriesForCurrentTermAsFollower'.
     }
   | RequestVote
     { r_term :: !Term
