@@ -383,10 +383,9 @@ modifyPersistentState ss f = do
 -- clients.
 
 smLoop :: ServerState cmd -> IO ()
-smLoop ss = do
+smLoop ss = CM.forever $ do
   sme <- CCC.readChan (ss_smQueue ss)
   handleSmEvent ss sme
-  smLoop ss
 
 handleSmEvent :: ServerState cmd -> SmEvent -> IO ()
 handleSmEvent ss sme = do
@@ -399,10 +398,9 @@ handleSmEvent ss sme = do
 ----------------------------------------------------------------
 
 mainLoop :: ServerState cmd -> IO ()
-mainLoop ss = do
+mainLoop ss = CM.forever $ do
   me <- CCC.readChan (ss_mainQueue ss)
   handleMainEvent ss me
-  mainLoop ss
 
 handleMainEvent :: ServerState cmd -> MainEvent cmd -> IO ()
 handleMainEvent ss (Rpc rpc) = handleRpc ss rpc
@@ -756,12 +754,11 @@ startServers _ numServers initialSmState = do
     serverIds = [ 1 .. numServers ]
 
 controlLoop :: Show cmd => ControllerState cmd -> IO ()
-controlLoop cs = do
+controlLoop cs = CM.forever $ do
   nwe <- CCC.readChan (cs_networkQueue cs)
   -- TODO
   debugController cs $
     printf "dropping NetworkEvent '%s'" (show nwe)
-  controlLoop cs
 
 startServer :: MVar () -> ServerState cmd -> IO (Async (), Async ())
 startServer lock ss = do
