@@ -120,13 +120,13 @@ import           Text.Printf ( PrintfType, printf )
 --
 --   - timer can be canceled / reset without firing its event.
 --
--- - [ ] Implement server initialization code.
+-- - [X] Implement server initialization code.
 --
---   - [ ] Initial state.
+--   - [X] Initial state.
 --
---   - [ ] Initial config.
+--   - [X] Initial config.
 --
---   - [ ] Setup whatever 'ss_sendRpc' needs.
+--   - [X] Setup whatever 'ss_sendRpc' needs.
 --
 -- - [ ] Implement state machine updater event loop.
 --
@@ -224,9 +224,13 @@ import           Text.Printf ( PrintfType, printf )
 --
 -- - @delay@: time to delay in milliseconds.
 -- - @action@: the action to run after the delay.
-delayedAction :: Int -> IO () -> IO (Async ())
-delayedAction delay action = do
-  CCA.async $ CC.threadDelay (1000 * delay) >> action
+delayAction :: Int -> IO () -> IO (Async ())
+delayAction delay action = do
+  CCA.async $ do
+    CC.threadDelay (1000 * delay)
+    -- Run the action in yet another thread, so that it can't be
+    -- accidentally canceled once it's started.
+    CM.void $ CCA.async action
 
 cancelTimer :: ServerState cmd -> IO ()
 cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
@@ -237,11 +241,20 @@ cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
 
 startHeartbeatTimer :: ServerState cmd -> IO ()
 startHeartbeatTimer ss = do
-  cancelTimer ss
-  -- Not really sure what a good value for the delay is, but this
-  -- seems quite conservative.
-  let delay = minElectionTimeout `div` 5
-  timer <- delayedAction delay $ sendAppendEntriesToAllFollowers ss
+  -- Not really sure what a good value for the delay is. If we divide
+  -- the 'minElectionTimeout' by @n@, then we expect to allow for @n -
+  -- 1@ failed deliveries in most cases, but only @n - 2@ failures
+  -- when the election timeout in the follower is very close to the
+  -- 'minElectionTimeout'.
+  --
+  -- In testing, smaller values are better here when we have no
+  -- surprise failures.
+  let worstCaseFailures = 1
+  let delay = minElectionTimeout `div` (worstCaseFailures + 2)
+  debug ss $ printf "startHeartbeatTimer: delay %i" delay
+  timer <- delayAction delay $ do
+    debug ss "startHeartbeatTimer: timer expired."
+    sendAppendEntriesToAllFollowers ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
 
 -- | Send all followers any log events they don't have yet.
@@ -254,6 +267,7 @@ sendAppendEntriesToAllFollowers ss = do
   let sids = c_otherServerIds . ps_config $ ps
   CM.forM_ sids $ \sid -> do
     sendAppendEntriesToOneFollower ss sid
+  startHeartbeatTimer ss
 
 sendAppendEntriesToOneFollower :: ServerState cmd -> ServerId -> IO ()
 sendAppendEntriesToOneFollower ss sid = do
@@ -289,14 +303,14 @@ minElectionTimeout = 3000
 
 startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
-  cancelTimer ss
   delay <- SR.randomRIO (minElectionTimeout, 2 * minElectionTimeout)
   debug ss $ printf "startElectionTimer: delay %i" delay
-  timer <- delayedAction delay $ handleElectionTimeout ss
+  timer <- delayAction delay $ handleElectionTimeout ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
 
 handleElectionTimeout :: ServerState cmd -> IO ()
 handleElectionTimeout ss = do
+  debug ss "handleElectionTimeout"
   role <- CCM.readMVar $ ss_role ss
   case role of
     Leader -> error "The leader should not be running an election timer!"
@@ -330,6 +344,7 @@ startElection ss = do
   CM.void $ CCM.swapMVar (ss_role ss) Candidate
   incrementTerm
   voteForSelf
+  cancelTimer ss
   startElectionTimer ss
   requestVotes
   where
@@ -466,6 +481,8 @@ handleRpc ss rpc = do
     -- from the current leader and our term is (now) equal to the
     -- rpc's term.
     handleAppendEntriesForCurrentTermAsFollower = do
+      cancelTimer ss
+      startElectionTimer ss
       ps <- CCM.readMVar (ss_persistentState ss)
       let lastLogIndex = le_index . last . ps_log $ ps
       let r_prevLogIndex' =
@@ -646,6 +663,7 @@ handleRpc ss rpc = do
 -- existing vote. Otherwise, we reset our vote to 'Nothing'.
 becomeFollower :: ServerState cmd -> Term -> IO ()
 becomeFollower ss newTerm = do
+  cancelTimer ss
   startElectionTimer ss
   CM.void $ CCM.swapMVar (ss_role ss) Follower
   currentTerm <- ps_currentTerm <$> CCM.readMVar (ss_persistentState ss)
@@ -663,7 +681,7 @@ becomeFollower ss newTerm = do
 -- See page 4.
 becomeLeader :: ServerState cmd -> IO ()
 becomeLeader ss = do
-  startHeartbeatTimer ss
+  cancelTimer ss
   initializeVolatileLeaderState
   CM.void $ CCM.swapMVar (ss_role ss) Leader
   sendAppendEntriesToAllFollowers ss
