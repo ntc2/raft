@@ -218,9 +218,14 @@ import           Text.Printf ( PrintfType, printf )
 -- * Delayed actions
 ----------------------------------------------------------------
 
--- | Run a delayed action, returning a handle that can be used to
--- cancel the delayed action -- using 'CCA.cancel' -- if it has not
--- run yet.
+-- | Run a delayed action that can be canceled if it has not started
+-- running yet..
+--
+-- Returns a handle that can be used to cancel the delayed action --
+-- using 'CCA.cancel' -- if it has not run yet. Once the delay is up
+-- and the delayed action begins to run, calling 'CCA.cancel' on the
+-- return value of 'delayAction' has no effect. This is by design, in
+-- case a timer itself calls 'cancelTimer'.
 --
 -- - @delay@: time to delay in milliseconds.
 -- - @action@: the action to run after the delay.
@@ -232,6 +237,18 @@ delayAction delay action = do
     -- accidentally canceled once it's started.
     CM.void $ CCA.async action
 
+-- | Start a timer that runs @action@ after @delay@.
+--
+-- Cancels any existing timer before starting the requested timer.
+startTimer :: ServerState cmd -> Int -> IO () -> IO ()
+startTimer ss delay action = do
+  cancelTimer ss
+  timer <- delayAction delay action
+  CM.void $ CCM.swapMVar (ss_timer ss) timer
+
+-- | Cancel any existing timer.
+--
+-- It's OK to call this multiple times on the same timer.
 cancelTimer :: ServerState cmd -> IO ()
 cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
 
@@ -252,10 +269,9 @@ startHeartbeatTimer ss = do
   let worstCaseFailures = 1
   let delay = minElectionTimeout `div` (worstCaseFailures + 2)
   debug ss $ printf "startHeartbeatTimer: delay %i" delay
-  timer <- delayAction delay $ do
+  startTimer ss delay $ do
     debug ss "startHeartbeatTimer: timer expired."
     sendAppendEntriesToAllFollowers ss
-  CM.void $ CCM.swapMVar (ss_timer ss) timer
 
 -- | Send all followers any log events they don't have yet.
 --
@@ -305,8 +321,7 @@ startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
   delay <- SR.randomRIO (minElectionTimeout, 2 * minElectionTimeout)
   debug ss $ printf "startElectionTimer: delay %i" delay
-  timer <- delayAction delay $ handleElectionTimeout ss
-  CM.void $ CCM.swapMVar (ss_timer ss) timer
+  startTimer ss delay $ handleElectionTimeout ss
 
 handleElectionTimeout :: ServerState cmd -> IO ()
 handleElectionTimeout ss = do
@@ -344,7 +359,6 @@ startElection ss = do
   CM.void $ CCM.swapMVar (ss_role ss) Candidate
   incrementTerm
   voteForSelf
-  cancelTimer ss
   startElectionTimer ss
   requestVotes
   where
@@ -481,7 +495,6 @@ handleRpc ss rpc = do
     -- from the current leader and our term is (now) equal to the
     -- rpc's term.
     handleAppendEntriesForCurrentTermAsFollower = do
-      cancelTimer ss
       startElectionTimer ss
       ps <- CCM.readMVar (ss_persistentState ss)
       let lastLogIndex = le_index . last . ps_log $ ps
@@ -663,7 +676,6 @@ handleRpc ss rpc = do
 -- existing vote. Otherwise, we reset our vote to 'Nothing'.
 becomeFollower :: ServerState cmd -> Term -> IO ()
 becomeFollower ss newTerm = do
-  cancelTimer ss
   startElectionTimer ss
   CM.void $ CCM.swapMVar (ss_role ss) Follower
   currentTerm <- ps_currentTerm <$> CCM.readMVar (ss_persistentState ss)
