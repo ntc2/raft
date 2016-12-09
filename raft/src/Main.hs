@@ -264,7 +264,8 @@ sendAppendEntriesToOneFollower ss sid = do
   let Just nextIndex =
         fromIntegral . unIndex <$> Map.lookup sid (vls_nextIndex vls)
   let entries = drop nextIndex $ ps_log ps
-  let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
+  -- The "previous" entry is the one before the "next" entry.
+  let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! (nextIndex - 1)
   ss_sendRpc ss sid $ AppendEntries
     { r_term = ps_currentTerm ps
     , r_leaderId = c_myServerId . ps_config $ ps
@@ -531,10 +532,10 @@ handleRpc ss rpc = do
             then do
             CM.when (r_term rpc == ps_currentTerm ps) $ do
               let nextIndex' = Map.insert (r_responderId rpc)
-                               (1 + r_lastLogIndex rpc)
+                               (r_nextLogIndex rpc)
                                (vls_nextIndex vls)
               let matchIndex' = Map.insert (r_responderId rpc)
-                                (r_lastLogIndex rpc)
+                                (r_nextLogIndex rpc - 1)
                                 (vls_matchIndex vls)
               CM.void $ CCM.swapMVar (ss_volatileLeaderState ss) $
                 Just $ vls { vls_nextIndex = nextIndex'
@@ -753,12 +754,15 @@ startServers _ numServers initialSmState = do
   where
     serverIds = [ 1 .. numServers ]
 
+-- | Read "network" events off the queue and deliver them.
 controlLoop :: Show cmd => ControllerState cmd -> IO ()
 controlLoop cs = CM.forever $ do
   nwe <- CCC.readChan (cs_networkQueue cs)
-  -- TODO
-  debugController cs $
-    printf "dropping NetworkEvent '%s'" (show nwe)
+  debugController cs $ show nwe
+  case nwe of
+    SendRpc sid rpc -> do
+      let Just ss = Map.lookup sid (cs_sidToSs cs)
+      CCC.writeChan (ss_mainQueue ss) $ Rpc rpc
 
 startServer :: MVar () -> ServerState cmd -> IO (Async (), Async ())
 startServer lock ss = do
