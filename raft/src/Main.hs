@@ -690,18 +690,18 @@ debug :: ServerState cmd -> String -> IO ()
 debug ss msg = do
   ps <- CCM.readMVar (ss_persistentState ss)
   ss_debug ss $
-    printf "Server %i: %s" (c_myServerId . ps_config $ ps) msg
+    printf "Server %i: %s\n" (c_myServerId . ps_config $ ps) msg
 
 data ControllerState cmd
   = ControllerState
     { cs_sidToSs :: !(Map ServerId (ServerState cmd))
     , cs_networkQueue :: !(Chan (NetworkEvent cmd))
-    , cs_debugQueue :: !(Chan String)
+    , cs_printfLock :: !(MVar ())
     }
 
 debugController :: ControllerState cmd -> String -> IO ()
 debugController cs msg = do
-  CCC.writeChan (cs_debugQueue cs) $ printf "Controller: %s" msg
+  printfConcurrent (cs_printfLock cs) $ printf "Controller: %s\n" msg
 
 -- | Print to console without garbling the output.
 --
@@ -734,37 +734,26 @@ startServers ::
   Proxy cmd -> Integer -> SmState cmd -> IO ()
 startServers _ numServers initialSmState = do
   (networkQueue :: Chan (NetworkEvent cmd)) <- CCC.newChan
-  debugQueue <- CCC.newChan
-  lock <- CCM.newMVar ()
+  printfLock <- CCM.newMVar ()
   sss <- CM.forM serverIds $ \myId -> do
     let config = Config
                  { c_otherServerIds = DL.delete myId serverIds
                  , c_myServerId = myId
                  }
-    mkInitialServerState config initialSmState debugQueue networkQueue
-  threadPairs <- CM.mapM (startServer lock) sss
+    mkInitialServerState config initialSmState printfLock networkQueue
+  threadPairs <- CM.mapM (startServer printfLock) sss
   let sidToSs = Map.fromList $ zip serverIds sss
   let cs = ControllerState
            { cs_sidToSs = sidToSs
            , cs_networkQueue = networkQueue
-           , cs_debugQueue = debugQueue
+           , cs_printfLock = printfLock
            }
-  debugThread <- CCA.async $
-    debugLoop lock cs `CES.finally`
-    printfConcurrent lock "debugLoop exiting!"
   controlLoop cs `CES.finally` do
     CM.forM_ threadPairs $ \(mainThread, smThread) -> do
       CCA.cancel mainThread
       CCA.cancel smThread
-    CCA.cancel debugThread
   where
     serverIds = [ 1 .. numServers ]
-
-debugLoop :: MVar () -> ControllerState cmd -> IO ()
-debugLoop lock cs = do
-  msg <- CCC.readChan (cs_debugQueue cs)
-  printfConcurrent lock $ printf "%s\n" msg
-  debugLoop lock cs
 
 controlLoop :: Show cmd => ControllerState cmd -> IO ()
 controlLoop cs = do
@@ -792,9 +781,9 @@ startServer lock ss = do
 
 -- | Initialize and return a 'ServerState'.
 mkInitialServerState ::
-  Config -> SmState cmd -> Chan String -> Chan (NetworkEvent cmd) ->
+  Config -> SmState cmd -> MVar () -> Chan (NetworkEvent cmd) ->
   IO (ServerState cmd)
-mkInitialServerState config smState debugQueue networkQueue = do
+mkInitialServerState config smState printfLock networkQueue = do
   ss_timer <- CCM.newMVar =<< CCA.async (return ())
   ss_mainQueue <- CCC.newChan
   ss_smQueue <- CCC.newChan
@@ -804,7 +793,7 @@ mkInitialServerState config smState debugQueue networkQueue = do
   ss_volatileLeaderState <- CCM.newMVar Nothing
   ss_volatileCandidateState <- CCM.newMVar Nothing
   let ss_sendRpc sid rpc = CCC.writeChan networkQueue (SendRpc sid rpc)
-  let ss_debug msg = CCC.writeChan debugQueue msg
+  let ss_debug msg = printfConcurrent printfLock msg
   return ServerState{..}
   where
     persistentState =
