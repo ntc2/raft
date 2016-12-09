@@ -125,7 +125,7 @@ main = do
 --
 --   - [ ] Initial config.
 --
---   - [ ] Setup whatever 'sendRpc' needs.
+--   - [ ] Setup whatever 'ss_sendRpc' needs.
 --
 -- - [ ] Implement state machine updater event loop.
 --
@@ -264,9 +264,9 @@ sendAppendEntriesToOneFollower ss sid = do
         fromIntegral . unIndex <$> Map.lookup sid (vls_nextIndex vls)
   let entries = drop nextIndex $ ps_log ps
   let LogEntry prevLogIndex prevLogTerm _ = ps_log ps !! nextIndex
-  sendRpc ss sid $ AppendEntries
+  ss_sendRpc ss sid $ AppendEntries
     { r_term = ps_currentTerm ps
-    , r_leaderId = ps_myServerId ps
+    , r_leaderId = c_myServerId . ps_config $ ps
     , r_prevLogIndex = prevLogIndex
     , r_prevLogTerm = prevLogTerm
     , r_entries = entries
@@ -333,22 +333,22 @@ startElection ss = do
         (\ps -> ps { ps_currentTerm = 1 + ps_currentTerm ps })
     voteForSelf = do
       modifyPersistentState ss $ \ps ->
-        ps { ps_votedFor = Just $ ps_myServerId ps }
+        ps { ps_votedFor = Just $ c_myServerId . ps_config $ ps }
       ps <- CCM.readMVar (ss_persistentState ss)
       -- Initialize the volatile candidate state and count our self
       -- vote. If we add more fields to the volatile candidate state,
       -- then create a separate initialization function.
       CM.void $ CCM.swapMVar (ss_volatileCandidateState ss)
         (Just $ VolatileCandidateState
-          { vcs_votesReceived = Set.singleton $ ps_myServerId ps })
+          { vcs_votesReceived = Set.singleton $ c_myServerId . ps_config $ ps })
     requestVotes = do
       ps <- CCM.readMVar (ss_persistentState ss)
       let LogEntry lastLogIndex lastLogTerm _cmd = last $ ps_log ps
       let sids = c_otherServerIds . ps_config $ ps
       CM.forM_ sids $ \sid ->
-        sendRpc ss sid $ RequestVote
+        ss_sendRpc ss sid $ RequestVote
           { r_term = ps_currentTerm ps
-          , r_candidateId = ps_myServerId ps
+          , r_candidateId = c_myServerId . ps_config $ ps
           , r_lastLogIndex = lastLogIndex
           , r_lastLogTerm = lastLogTerm
           }
@@ -432,11 +432,11 @@ handleRpc ss rpc = do
       ps <- CCM.readMVar (ss_persistentState ss)
       role <- CCM.readMVar (ss_role ss)
       case r_term rpc `compare` ps_currentTerm ps of
-        LT -> sendRpc ss (r_leaderId rpc)
+        LT -> ss_sendRpc ss (r_leaderId rpc)
               AppendEntriesResponse
               { r_term = ps_currentTerm ps
               , r_success = False
-              , r_responderId = ps_myServerId ps
+              , r_responderId = c_myServerId . ps_config $ ps
                 -- This field is not meaningful in this case.
               , r_nextLogIndex = r_lastLogIndex rpc
               }
@@ -471,11 +471,11 @@ handleRpc ss rpc = do
         -- decrementing `r_prevLogIndex` by one; see the end of
         -- Section 5.3. However, the paper says this optimization is
         -- not useful in practice.
-        sendRpc ss (r_leaderId rpc)
+        ss_sendRpc ss (r_leaderId rpc)
           AppendEntriesResponse
           { r_term = r_term rpc
           , r_success = False
-          , r_responderId = ps_myServerId ps
+          , r_responderId = c_myServerId . ps_config $ ps
           -- This is the non-optimized part.
           , r_nextLogIndex = r_lastLogIndex rpc
           }
@@ -490,12 +490,12 @@ handleRpc ss rpc = do
             vs { vs_commitIndex = r_leaderCommit rpc `min`
                                   newLastLogIndex
                }
-          CCC.writeChan (ss_smQueue ss) UpdateSM
-        sendRpc ss (r_leaderId rpc)
+          CCC.writeChan (ss_smQueue ss) UpdateSm
+        ss_sendRpc ss (r_leaderId rpc)
           AppendEntriesResponse
           { r_term = r_term rpc
           , r_success = True
-          , r_responderId = ps_myServerId ps
+          , r_responderId = c_myServerId . ps_config $ ps
           , r_nextLogIndex = newLastLogIndex + 1
           }
 
@@ -558,11 +558,11 @@ handleRpc ss rpc = do
     handleRequestVote = do
       ps <- CCM.readMVar (ss_persistentState ss)
       case r_term rpc `compare` ps_currentTerm ps of
-        LT -> sendRpc ss (r_candidateId rpc)
+        LT -> ss_sendRpc ss (r_candidateId rpc)
               RequestVoteResponse
               { r_term = ps_currentTerm ps
               , r_voteGranted = False
-              , r_responderId = ps_myServerId ps
+              , r_responderId = c_myServerId . ps_config $ ps
               }
         EQ -> voteAccordingly
         GT -> do
@@ -574,11 +574,11 @@ handleRpc ss rpc = do
       ps <- CCM.readMVar (ss_persistentState ss)
       case ps_votedFor ps of
         -- Already voted.
-        Just voteId -> sendRpc ss (r_candidateId rpc)
+        Just voteId -> ss_sendRpc ss (r_candidateId rpc)
                     RequestVoteResponse
                     { r_term = r_term rpc
                     , r_voteGranted = voteId == r_candidateId rpc
-                    , r_responderId = ps_myServerId ps
+                    , r_responderId = c_myServerId . ps_config $ ps
                     }
         -- Haven't voted.
         Nothing -> do
@@ -591,11 +591,11 @@ handleRpc ss rpc = do
           CM.when candidateIsUpToDate $ do
             modifyPersistentState ss $ \ps ->
               ps { ps_votedFor = Just $ r_candidateId rpc }
-          sendRpc ss (r_candidateId rpc)
+          ss_sendRpc ss (r_candidateId rpc)
             RequestVoteResponse
             { r_term = r_term rpc
             , r_voteGranted = candidateIsUpToDate
-            , r_responderId = ps_myServerId ps
+            , r_responderId = c_myServerId . ps_config $ ps
             }
 
     -- Cases to consider:
@@ -674,8 +674,13 @@ becomeLeader ss = do
 -- | Use a @newtype@ to decrease the chance of accidentally
 -- interchanging a 'Term' and an 'Index', since they are both
 -- 'Integer' and used in similar places.
-newtype Term = Term { unTerm :: Integer }
+newtype Term = Term Integer
   deriving ( Eq, Num, Ord, Show )
+-- | A separate projection function, so that it doesn't clutter the
+-- derived 'Show' instance.
+unTerm :: Term -> Integer
+unTerm (Term x) = x
+
 -- | Treat this opaquely, so I can change it later, e.g. to add
 -- networking. Or, could always use integers to represent server ids,
 -- and have a separate abstraction that contacts servers using their
@@ -684,8 +689,9 @@ newtype Term = Term { unTerm :: Integer }
 -- > send :: ServerId -> RPC -> m ()
 type ServerId = Integer
 -- | See 'Term' above.
-newtype Index = Index { unIndex :: Integer }
+newtype Index = Index Integer
   deriving ( Eq, Num, Ord, Show )
+unIndex (Index x) = x
 
 -- | Log entries are parameterized by the command type @cmd@. E.g.,
 -- for a key-value store service as used in the paper, the command
@@ -722,9 +728,6 @@ data PersistentState cmd
       -- entry at index 1, i.e. the first real log entry.
     , ps_log :: ![LogEntry cmd]
       -- | Id of this server.
-    , ps_myServerId :: !ServerId
-      -- | Persistent in case we implement live configuration changes
-      -- later.
     , ps_config :: !Config
     }
   deriving ( Show )
@@ -799,6 +802,7 @@ data Config
   = Config
     { c_otherServerIds :: ![ServerId]
       -- ^ The set of server IDs for all servers *not* including us.
+    , c_myServerId :: !ServerId
     }
   deriving ( Show )
 
@@ -833,4 +837,6 @@ data ServerState cmd
     , ss_volatileState :: !(MVar (VolatileState cmd))
     , ss_volatileLeaderState :: !(MVar (Maybe VolatileLeaderState))
     , ss_volatileCandidateState :: !(MVar (Maybe VolatileCandidateState))
+    , ss_sendRpc :: !(ServerId -> Rpc cmd -> IO ())
+    , ss_debug :: !(String -> IO ())
     }
