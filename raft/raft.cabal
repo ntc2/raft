@@ -20,3 +20,4 @@ executable raft
                      , async
                      , containers
                      , random
+                     , safe-exceptions

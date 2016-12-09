@@ -1,6 +1,8 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE StandaloneDeriving #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 module Main where
@@ -12,17 +14,16 @@ import           Control.Concurrent.Chan ( Chan )
 import qualified Control.Concurrent.Chan as CCC
 import           Control.Concurrent.MVar ( MVar )
 import qualified Control.Concurrent.MVar as CCM
+import qualified Control.Exception.Safe as CES
 import qualified Control.Monad as CM
+import qualified Data.List as DL
 import           Data.Map.Strict ( Map )
 import qualified Data.Map.Strict as Map
+import           Data.Proxy
 import           Data.Set ( Set )
 import qualified Data.Set as Set
 import qualified System.Random as SR
-
-main :: IO ()
-main = do
-  putStrLn "hello world"
-
+import           Text.Printf ( PrintfType, printf )
 
 ----------------------------------------------------------------
 -- * Client
@@ -225,7 +226,7 @@ main = do
 -- - @action@: the action to run after the delay.
 delayedAction :: Int -> IO () -> IO (Async ())
 delayedAction delay action = do
-  CCA.async $ CC.threadDelay delay >> action
+  CCA.async $ CC.threadDelay (1000 * delay) >> action
 
 cancelTimer :: ServerState cmd -> IO ()
 cancelTimer ss = CCA.cancel =<< CCM.readMVar (ss_timer ss)
@@ -277,15 +278,19 @@ sendAppendEntriesToOneFollower ss sid = do
 -- * Election timer
 ----------------------------------------------------------------
 
--- | The election timeout is randomly chosen between 'minElectionTimeout'
--- and @2 * minElectionTimeout@, on each iteration of the election loop.
+-- | The election timeout is randomly chosen between
+-- 'minElectionTimeout' and @2 * minElectionTimeout@, on each
+-- iteration of the election loop.
+--
+-- Paper suggests 150. Larger values are useful for testing.
 minElectionTimeout :: Int
-minElectionTimeout = 150 -- Paper suggestion.
+minElectionTimeout = 3000
 
 startElectionTimer :: ServerState cmd -> IO ()
 startElectionTimer ss = do
   cancelTimer ss
   delay <- SR.randomRIO (minElectionTimeout, 2 * minElectionTimeout)
+  debug ss $ printf "startElectionTimer: delay %i" delay
   timer <- delayedAction delay $ handleElectionTimeout ss
   CM.void $ CCM.swapMVar (ss_timer ss) timer
 
@@ -371,15 +376,23 @@ modifyPersistentState ss f = do
     persist _ss = return ()
 
 ----------------------------------------------------------------
--- * RPCs
+-- * State machine loop
 ----------------------------------------------------------------
+--
+-- Responsible for updating the state machine state and responding to
+-- clients.
 
--- | Send an RPC to another server.
-sendRpc :: ServerState cmd -> ServerId -> Rpc cmd -> IO ()
-sendRpc ss sid rpc = do
-  -- Plan: have a mapping from 'ServerId' to 'ServerState' and put the
-  -- rpc on the corresponding main loop queue.
-  undefined ss sid rpc
+smLoop :: ServerState cmd -> IO ()
+smLoop ss = do
+  sme <- CCC.readChan (ss_smQueue ss)
+  handleSmEvent ss sme
+  smLoop ss
+
+handleSmEvent :: ServerState cmd -> SmEvent -> IO ()
+handleSmEvent ss sme = do
+  -- TODO
+  debug ss $
+    printf "dropping SmEvent '%s'." (show sme)
 
 ----------------------------------------------------------------
 -- * Main event loop
@@ -668,6 +681,150 @@ becomeLeader ss = do
         }
 
 ----------------------------------------------------------------
+-- Debugging.
+----------------------------------------------------------------
+--
+-- Can toggle debugging on and off in the config (later).
+
+debug :: ServerState cmd -> String -> IO ()
+debug ss msg = do
+  ps <- CCM.readMVar (ss_persistentState ss)
+  ss_debug ss $
+    printf "Server %i: %s" (c_myServerId . ps_config $ ps) msg
+
+data ControllerState cmd
+  = ControllerState
+    { cs_sidToSs :: !(Map ServerId (ServerState cmd))
+    , cs_networkQueue :: !(Chan (NetworkEvent cmd))
+    , cs_debugQueue :: !(Chan String)
+    }
+
+debugController :: ControllerState cmd -> String -> IO ()
+debugController cs msg = do
+  CCC.writeChan (cs_debugQueue cs) $ printf "Controller: %s" msg
+
+-- | Print to console without garbling the output.
+--
+-- The lock is used to avoid two callers writing at the same time.
+printfConcurrent :: MVar () -> String -> IO ()
+printfConcurrent lock msg =
+  CCM.withMVar lock (const $ printf msg)
+
+----------------------------------------------------------------
+-- Startup / initialization.
+----------------------------------------------------------------
+
+-- | Run some example servers.
+main :: IO ()
+main = do
+  startServers (Proxy :: Proxy DummyCmd) 3 dummyInitialSmState
+
+-- | A command type for which there is no state-machine state.
+data DummyCmd = DummyCmd deriving ( Show )
+type instance SmState DummyCmd = ()
+
+dummyInitialSmState :: SmState DummyCmd
+dummyInitialSmState = ()
+
+----------------------------------------------------------------
+
+startServers ::
+  forall cmd.
+  Show cmd =>
+  Proxy cmd -> Integer -> SmState cmd -> IO ()
+startServers _ numServers initialSmState = do
+  (networkQueue :: Chan (NetworkEvent cmd)) <- CCC.newChan
+  debugQueue <- CCC.newChan
+  lock <- CCM.newMVar ()
+  sss <- CM.forM serverIds $ \myId -> do
+    let config = Config
+                 { c_otherServerIds = DL.delete myId serverIds
+                 , c_myServerId = myId
+                 }
+    mkInitialServerState config initialSmState debugQueue networkQueue
+  threadPairs <- CM.mapM (startServer lock) sss
+  let sidToSs = Map.fromList $ zip serverIds sss
+  let cs = ControllerState
+           { cs_sidToSs = sidToSs
+           , cs_networkQueue = networkQueue
+           , cs_debugQueue = debugQueue
+           }
+  debugThread <- CCA.async $
+    debugLoop lock cs `CES.finally`
+    printfConcurrent lock "debugLoop exiting!"
+  controlLoop cs `CES.finally` do
+    CM.forM_ threadPairs $ \(mainThread, smThread) -> do
+      CCA.cancel mainThread
+      CCA.cancel smThread
+    CCA.cancel debugThread
+  where
+    serverIds = [ 1 .. numServers ]
+
+debugLoop :: MVar () -> ControllerState cmd -> IO ()
+debugLoop lock cs = do
+  msg <- CCC.readChan (cs_debugQueue cs)
+  printfConcurrent lock $ printf "%s\n" msg
+  debugLoop lock cs
+
+controlLoop :: Show cmd => ControllerState cmd -> IO ()
+controlLoop cs = do
+  nwe <- CCC.readChan (cs_networkQueue cs)
+  -- TODO
+  debugController cs $
+    printf "dropping NetworkEvent '%s'" (show nwe)
+  controlLoop cs
+
+startServer :: MVar () -> ServerState cmd -> IO (Async (), Async ())
+startServer lock ss = do
+  ps <- CCM.readMVar (ss_persistentState ss)
+  let myId = c_myServerId . ps_config $ ps
+  mainThread <- CCA.async $ do
+    becomeFollower ss 0
+    mainLoop ss `CES.finally` do
+      cancelTimer ss
+      printfConcurrent lock $
+        printf "Server %i: mainLoop exiting!\n" myId
+  smThread <- CCA.async $ do
+    smLoop ss `CES.finally` do
+      printfConcurrent lock $
+        printf "Server %i: smLoop exiting!\n" myId
+  return (mainThread, smThread)
+
+-- | Initialize and return a 'ServerState'.
+mkInitialServerState ::
+  Config -> SmState cmd -> Chan String -> Chan (NetworkEvent cmd) ->
+  IO (ServerState cmd)
+mkInitialServerState config smState debugQueue networkQueue = do
+  ss_timer <- CCM.newMVar =<< CCA.async (return ())
+  ss_mainQueue <- CCC.newChan
+  ss_smQueue <- CCC.newChan
+  ss_role <- CCM.newMVar Follower
+  ss_persistentState <- CCM.newMVar persistentState
+  ss_volatileState <- CCM.newMVar volatileState
+  ss_volatileLeaderState <- CCM.newMVar Nothing
+  ss_volatileCandidateState <- CCM.newMVar Nothing
+  let ss_sendRpc sid rpc = CCC.writeChan networkQueue (SendRpc sid rpc)
+  let ss_debug msg = CCC.writeChan debugQueue msg
+  return ServerState{..}
+  where
+    persistentState =
+      PersistentState
+      { ps_currentTerm = 0
+      , ps_votedFor = Nothing
+      -- Initialize the log with a dummy event, so that we don't have
+      -- to have a special case for empty logs. This also allows us to
+      -- use log indices to index into the log list.
+      , ps_log = [ LogEntry 0 0 NoOp ]
+      , ps_config = config
+      }
+    volatileState =
+      VolatileState
+      { vs_commitIndex = 0
+      , vs_lastApplied = 0
+      , vs_smState = smState
+      }
+
+----------------------------------------------------------------
 -- * Types
 ----------------------------------------------------------------
 
@@ -702,8 +859,17 @@ data LogEntry cmd =
   LogEntry
   { le_index :: !Index
   , le_term :: !Term
-  , le_cmd :: !cmd
+  , le_cmd :: !(Command cmd)
   }
+  deriving ( Show )
+
+data Command cmd
+    -- We initialize the logs with a no-op event. Also, new leaders
+    -- can use no-op events when they want to increase their commit
+    -- index, but have no committed commands from their term; see
+    -- Section 5.4.2.
+  = NoOp
+  | Command cmd
   deriving ( Show )
 
 {-
@@ -813,8 +979,13 @@ data MainEvent cmd
   deriving ( Show )
 
 -- | Event for the state machine queue.
-data SMEvent
-  = UpdateSM
+data SmEvent
+  = UpdateSm
+  deriving ( Show )
+
+-- | Event for the controller thread network simulation queue.
+data NetworkEvent cmd
+  = SendRpc !ServerId !(Rpc cmd)
   deriving ( Show )
 
 -- | All of the server state.
@@ -830,7 +1001,7 @@ data ServerState cmd
       -- 'IORef' here as writes correspond to restarting the timer.
     , ss_mainQueue :: !(Chan (MainEvent cmd))
       -- ^ Main loop event queue.
-    , ss_smQueue :: !(Chan SMEvent)
+    , ss_smQueue :: !(Chan SmEvent)
       -- ^ State machine event queue.
     , ss_role :: !(MVar ServerRole)
     , ss_persistentState :: !(MVar (PersistentState cmd))
